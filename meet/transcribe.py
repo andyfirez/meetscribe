@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Fix for CUDA NVRTC version mismatch: pyannote's wespeaker embedding model
 # uses torch.vmap -> torch.fft.rfft which triggers NVRTC JIT compilation.
@@ -106,6 +106,217 @@ def resolve_model(name: str) -> str:
     return name
 
 
+# ── Alignment model registry ───────────────────────────────────────────────
+# Maps language codes to (model_name, model_type) where model_type is
+# "torchaudio" or "huggingface".  Only languages we actively support are
+# listed here; WhisperX supports ~39 but we only manage downloads for the
+# ones the user cares about.
+
+ALIGNMENT_MODELS: dict[str, tuple[str, str]] = {
+    "en": ("WAV2VEC2_ASR_BASE_960H", "torchaudio"),
+    "de": ("VOXPOPULI_ASR_BASE_10K_DE", "torchaudio"),
+    "fr": ("VOXPOPULI_ASR_BASE_10K_FR", "torchaudio"),
+    "es": ("VOXPOPULI_ASR_BASE_10K_ES", "torchaudio"),
+    "tr": ("mpoyraz/wav2vec2-xls-r-300m-cv7-turkish", "huggingface"),
+    "fa": ("jonatasgrosman/wav2vec2-large-xlsr-53-persian", "huggingface"),
+}
+
+# torchaudio pipeline names → local .pt filenames in ~/.cache/torch/hub/checkpoints/
+_TORCHAUDIO_FILENAMES: dict[str, str] = {
+    "WAV2VEC2_ASR_BASE_960H": "wav2vec2_fairseq_base_ls960_asr_ls960.pth",
+    "VOXPOPULI_ASR_BASE_10K_DE": "wav2vec2_voxpopuli_base_10k_asr_de.pt",
+    "VOXPOPULI_ASR_BASE_10K_FR": "wav2vec2_voxpopuli_base_10k_asr_fr.pt",
+    "VOXPOPULI_ASR_BASE_10K_ES": "wav2vec2_voxpopuli_base_10k_asr_es.pt",
+}
+
+# Approximate download sizes for user display
+_MODEL_SIZES: dict[str, str] = {
+    "en": "~360 MB",
+    "de": "~360 MB",
+    "fr": "~360 MB",
+    "es": "~360 MB",
+    "tr": "~1.2 GB",
+    "fa": "~1.2 GB",
+}
+
+from meet.languages import LANG_NAMES as _LANG_NAMES  # noqa: E402
+MODEL_SIZES = _MODEL_SIZES  # public accessor
+
+
+class AlignmentModelMissing(Exception):
+    """Raised when an alignment model is not cached locally.
+
+    Carries enough context for CLI/GUI to display actionable guidance.
+    """
+
+    def __init__(self, lang: str):
+        model_name, model_type = ALIGNMENT_MODELS.get(lang, ("unknown", "unknown"))
+        self.lang = lang
+        self.lang_name = _LANG_NAMES.get(lang, lang)
+        self.model_name = model_name
+        self.model_type = model_type
+        self.estimated_size = _MODEL_SIZES.get(lang, "unknown size")
+        super().__init__(
+            f"Alignment model for {self.lang_name} ({lang}) is not downloaded.\n"
+            f"  Model: {model_name} ({model_type}, {self.estimated_size})\n"
+            f"  Run:   meet download {lang}"
+        )
+
+
+def check_alignment_model_cached(lang: str) -> bool:
+    """Check if the alignment model for *lang* is cached locally.
+
+    Does NOT download anything — purely a filesystem check.
+
+    Returns True if cached, False if missing.
+    """
+    if lang not in ALIGNMENT_MODELS:
+        # Language not in our registry — WhisperX may still support it
+        # (it has 39 languages).  We can't check, so assume it's fine
+        # and let WhisperX handle the error at runtime.
+        return True
+
+    model_name, model_type = ALIGNMENT_MODELS[lang]
+
+    if model_type == "torchaudio":
+        filename = _TORCHAUDIO_FILENAMES.get(model_name)
+        if not filename:
+            return True  # Unknown filename — can't check
+        cache_path = Path.home() / ".cache" / "torch" / "hub" / "checkpoints" / filename
+        return cache_path.exists()
+
+    elif model_type == "huggingface":
+        # HuggingFace models are stored as models--<org>--<model>/
+        # with a snapshots/ subdirectory containing the actual weights.
+        safe_name = model_name.replace("/", "--")
+        model_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{safe_name}"
+        if not model_dir.exists():
+            return False
+        # Check that there's at least one snapshot (complete download)
+        snapshots_dir = model_dir / "snapshots"
+        if not snapshots_dir.exists():
+            return False
+        # At least one non-empty snapshot directory
+        return any(snapshots_dir.iterdir())
+
+    return True
+
+
+def download_alignment_model(
+    lang: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Download the alignment model for *lang*.
+
+    Args:
+        lang: Language code (e.g. "de", "tr").
+        progress_callback: Optional callable(status_message) for progress updates.
+
+    Raises:
+        ValueError: If the language is not in our registry.
+        RuntimeError: If the download fails.
+    """
+    if lang not in ALIGNMENT_MODELS:
+        supported = ", ".join(sorted(ALIGNMENT_MODELS.keys()))
+        raise ValueError(
+            f"No alignment model registered for '{lang}'. "
+            f"Supported: {supported}"
+        )
+
+    model_name, model_type = ALIGNMENT_MODELS[lang]
+    lang_name = _LANG_NAMES.get(lang, lang)
+    size = _MODEL_SIZES.get(lang, "unknown size")
+
+    def _status(msg: str) -> None:
+        if progress_callback:
+            progress_callback(msg)
+        else:
+            print(f"  {msg}")
+
+    _status(f"Downloading alignment model for {lang_name} ({model_name}, {size})...")
+
+    if model_type == "torchaudio":
+        import torchaudio
+        # Load the pipeline — this triggers the download.
+        bundle = getattr(torchaudio.pipelines, model_name)
+        _status(f"Loading torchaudio bundle {model_name}...")
+        bundle.get_model()
+        _status(f"Alignment model for {lang_name} downloaded successfully.")
+
+    elif model_type == "huggingface":
+        from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+        _status(f"Downloading HuggingFace model {model_name}...")
+        Wav2Vec2Processor.from_pretrained(model_name)
+        Wav2Vec2ForCTC.from_pretrained(model_name)
+        _status(f"Alignment model for {lang_name} downloaded successfully.")
+
+
+def get_supported_alignment_languages() -> dict[str, dict[str, str]]:
+    """Return info about all supported alignment languages.
+
+    Returns dict of lang_code -> {name, model, type, size, cached}.
+    """
+    result = {}
+    for lang, (model_name, model_type) in ALIGNMENT_MODELS.items():
+        result[lang] = {
+            "name": _LANG_NAMES.get(lang, lang),
+            "model": model_name,
+            "type": model_type,
+            "size": _MODEL_SIZES.get(lang, "unknown"),
+            "cached": check_alignment_model_cached(lang),
+        }
+    return result
+
+
+# ── GPU resource management ────────────────────────────────────────────────
+
+def ensure_gpu_available(
+    progress_callback: Callable[[str], None] | None = None,
+) -> None:
+    """Ensure GPU VRAM is available for transcription.
+
+    Checks if Ollama has models loaded and unloads them to free VRAM.
+    This is transparent — we tell the user what we're doing.
+    """
+    import json as _json
+
+    def _status(msg: str) -> None:
+        if progress_callback:
+            progress_callback(msg)
+        else:
+            print(f"  {msg}")
+
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "http://localhost:11434/api/ps"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return  # Ollama not running — nothing to do
+
+        data = _json.loads(result.stdout)
+        models = data.get("models", [])
+        if not models:
+            return  # No models loaded
+
+        for model_info in models:
+            model_name = model_info.get("name", "unknown")
+            _status(f"Unloading Ollama model ({model_name}) to free GPU memory for transcription...")
+            subprocess.run(
+                ["curl", "-s", "http://localhost:11434/api/generate",
+                 "-d", _json.dumps({"model": model_name, "keep_alive": 0})],
+                capture_output=True, text=True, timeout=30,
+            )
+
+        # Brief pause to let VRAM actually free up
+        import time
+        time.sleep(2)
+        _status("GPU memory freed.")
+
+    except (subprocess.TimeoutExpired, _json.JSONDecodeError, FileNotFoundError):
+        pass  # Ollama not installed or not responding — fine
+
+
 @dataclass
 class TranscriptionConfig:
     """Configuration for the transcription pipeline."""
@@ -114,7 +325,7 @@ class TranscriptionConfig:
     device: str = "cuda"
     compute_type: str = "float16"
     batch_size: int = 16
-    language: str = "en"
+    language: str = "auto"
     hf_token: str | None = None
     min_speakers: int | None = None
     max_speakers: int | None = None
@@ -130,6 +341,10 @@ class TranscriptionConfig:
     # Seconds of silence to pad at the end of audio before transcription.
     # Gives the VAD room to properly close the final speech segment.
     audio_pad_seconds: float = 3.0
+    # If True, skip the alignment step entirely (no word-level timestamps,
+    # fewer segments).  Used when alignment model is missing and the user
+    # chose not to download it.
+    skip_alignment: bool = False
 
     def __post_init__(self):
         # Resolve model aliases (e.g. "large-v3-turbo" -> local CTranslate2 path)
@@ -237,21 +452,7 @@ class Transcript:
         return files
 
 
-def _fmt_time(seconds: float) -> str:
-    """Format seconds as HH:MM:SS."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
-def _fmt_srt_time(seconds: float) -> str:
-    """Format seconds as SRT timestamp HH:MM:SS,mmm."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int((seconds % 1) * 1000)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+from meet.utils import fmt_time as _fmt_time, fmt_srt_time as _fmt_srt_time  # noqa: E402
 
 
 def _extract_mono(audio_file: Path, channel: int = 0) -> Path:
@@ -284,28 +485,106 @@ def _extract_mono(audio_file: Path, channel: int = 0) -> Path:
 
 
 def _mixdown_to_mono(audio_file: Path) -> Path:
-    """Extract mic channel (left) as mono for transcription.
+    """Mix both channels to mono with RMS normalization for transcription.
 
-    We use the mic channel rather than averaging both channels because:
-    - The mic captures both your voice (directly) and remote audio (room echo)
-    - Averaging with the system channel halves your voice energy when only you
-      are speaking (system channel = 0), causing VAD to miss trailing speech
+    Normalizes each channel to equal RMS before averaging so that both
+    your mic and the remote participants contribute equally to the mono
+    signal.  This prevents the common failure mode where a quiet mic
+    channel causes Whisper to miss all remote speech (which lives only
+    on the system-audio channel).
+
+    Falls back to a simple ffmpeg average if numpy is unavailable.
     """
+    import struct
+    import wave
+
+    try:
+        import numpy as np
+    except ImportError:
+        # Fallback: simple ffmpeg average of both channels.
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(audio_file),
+            "-filter_complex", "[0:a]pan=mono|c0=0.5*c0+0.5*c1[out]",
+            "-map", "[out]",
+            "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            tmp.name,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Mono mixdown failed: {result.stderr}")
+        return Path(tmp.name)
+
+    # ── Read stereo WAV ──
+    with wave.open(str(audio_file), "r") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+
+    if n_channels != 2 or sampwidth != 2:
+        # Not the expected stereo 16-bit — fall through to ffmpeg.
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(audio_file),
+            "-filter_complex", "[0:a]pan=mono|c0=0.5*c0+0.5*c1[out]",
+            "-map", "[out]",
+            "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            tmp.name,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Mono mixdown failed: {result.stderr}")
+        return Path(tmp.name)
+
+    data = np.frombuffer(raw, dtype=np.int16).reshape(-1, 2)
+    left = data[:, 0].astype(np.float32)   # mic (YOU)
+    right = data[:, 1].astype(np.float32)  # system (REMOTE)
+
+    # ── RMS of each channel (ignore near-silence) ──
+    silence_thr = 50.0  # ~-50 dBFS for 16-bit
+    left_active = left[np.abs(left) > silence_thr]
+    right_active = right[np.abs(right) > silence_thr]
+
+    left_rms = np.sqrt(np.mean(left_active ** 2)) if len(left_active) > 0 else 0.0
+    right_rms = np.sqrt(np.mean(right_active ** 2)) if len(right_active) > 0 else 0.0
+
+    # ── Normalize to equal RMS, then average ──
+    if left_rms > 0 and right_rms > 0:
+        # Scale the quieter channel up to match the louder one.
+        target_rms = max(left_rms, right_rms)
+        left_scaled = left * (target_rms / left_rms)
+        right_scaled = right * (target_rms / right_rms)
+        mono = (left_scaled + right_scaled) * 0.5
+    elif right_rms > 0:
+        # Mic is dead — use system channel only.
+        mono = right
+    elif left_rms > 0:
+        # System channel is dead — use mic only.
+        mono = left
+    else:
+        # Both silent — just average.
+        mono = (left + right) * 0.5
+
+    # Clip to int16 range and convert.
+    mono = np.clip(mono, -32768, 32767).astype(np.int16)
+
+    # ── Write mono WAV ──
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
+    with wave.open(tmp.name, "w") as wf_out:
+        wf_out.setnchannels(1)
+        wf_out.setsampwidth(2)
+        wf_out.setframerate(framerate)
+        wf_out.writeframes(mono.tobytes())
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(audio_file),
-        "-filter_complex", "[0:a]pan=mono|c0=c0[out]",
-        "-map", "[out]",
-        "-ar", "16000",
-        "-c:a", "pcm_s16le",
-        tmp.name,
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Failed to extract mic channel: {result.stderr}")
     return Path(tmp.name)
 
 
@@ -368,11 +647,14 @@ def transcribe(audio_file: str | Path, config: TranscriptionConfig | None = None
             "vad_offset": config.vad_offset,
         }
 
+        # "auto" means let WhisperX detect the language from the audio.
+        whisper_lang = None if config.language == "auto" else config.language
+
         model = whisperx.load_model(
             config.model,
             config.device,
             compute_type=config.compute_type,
-            language=config.language,
+            language=whisper_lang,
             vad_options=vad_options,
         )
 
@@ -388,29 +670,55 @@ def transcribe(audio_file: str | Path, config: TranscriptionConfig | None = None
 
         result = model.transcribe(audio, batch_size=config.batch_size)
 
+        # Resolve the actual language (important when auto-detecting).
+        detected_language = result.get("language", whisper_lang or "en")
+        if config.language == "auto":
+            print(f"  Detected language: {detected_language}")
+
         # Free transcription model memory
         del model
         gc.collect()
         torch.cuda.empty_cache()
 
         # ── Step 2: Align for word-level timestamps ──
-        print(f"  Aligning word timestamps...")
-        model_a, metadata = whisperx.load_align_model(
-            language_code=config.language,
-            device=config.device,
-        )
-        result = whisperx.align(
-            result["segments"],
-            model_a,
-            metadata,
-            audio,
-            config.device,
-            return_char_alignments=False,
-        )
+        if config.skip_alignment:
+            print(f"  Skipping alignment (--skip-alignment)")
+        elif detected_language in ALIGNMENT_MODELS and not check_alignment_model_cached(detected_language):
+            # Model is in our registry but not downloaded — raise so
+            # the caller (CLI/GUI) can show an actionable error.
+            # Free VRAM first so the error handler can download if needed.
+            gc.collect()
+            torch.cuda.empty_cache()
+            raise AlignmentModelMissing(detected_language)
+        else:
+            print(f"  Aligning word timestamps ({detected_language})...")
+            try:
+                model_a, metadata = whisperx.load_align_model(
+                    language_code=detected_language,
+                    device=config.device,
+                )
+                result = whisperx.align(
+                    result["segments"],
+                    model_a,
+                    metadata,
+                    audio,
+                    config.device,
+                    return_char_alignments=False,
+                )
 
-        del model_a
-        gc.collect()
-        torch.cuda.empty_cache()
+                del model_a
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception as align_exc:
+                # For languages NOT in our registry (WhisperX supports ~39),
+                # we can't pre-check the cache.  If the download fails at
+                # runtime, fall back gracefully since there's no actionable
+                # fix we can offer.
+                if detected_language in ALIGNMENT_MODELS:
+                    # This shouldn't happen (we checked cache above), but
+                    # if it does, re-raise as AlignmentModelMissing.
+                    raise AlignmentModelMissing(detected_language) from align_exc
+                print(f"  Warning: alignment failed ({align_exc}), continuing without word-level timestamps")
 
         # ── Step 3: Speaker diarization ──
         if config.hf_token:
@@ -470,7 +778,7 @@ def transcribe(audio_file: str | Path, config: TranscriptionConfig | None = None
         return Transcript(
             segments=segments,
             speakers=speakers,
-            language=config.language,
+            language=detected_language,
             audio_file=str(audio_path),
             duration=duration,
         )
@@ -506,91 +814,22 @@ def _label_speakers_from_channels(
     Returns:
         Updated (segments, speakers) with relabeled speaker IDs.
     """
-    import numpy as np
-    import wave
+    from meet.audio import read_stereo_channels, compute_speaker_channel_energy
 
     if not speakers:
         return segments, speakers
 
-    # Read stereo WAV directly — faster than spawning ffmpeg
-    try:
-        with wave.open(str(stereo_file), "rb") as wf:
-            n_channels = wf.getnchannels()
-            if n_channels != 2:
-                print(f"  Channel labeling: skipping, not stereo ({n_channels} ch)")
-                return segments, speakers
-
-            sampwidth = wf.getsampwidth()
-            file_sr = wf.getframerate()
-            n_frames = wf.getnframes()
-            raw = wf.readframes(n_frames)
-    except Exception as e:
-        print(f"  Channel labeling: skipping, cannot read WAV: {e}")
+    stereo = read_stereo_channels(stereo_file)
+    if stereo is None:
+        print(f"  Channel labeling: skipping, not stereo or unreadable")
         return segments, speakers
 
-    # Parse interleaved samples into separate channels
-    if sampwidth == 2:
-        dtype = np.int16
-    elif sampwidth == 4:
-        dtype = np.int32
-    else:
-        print(f"  Channel labeling: skipping, unsupported sample width {sampwidth}")
+    speaker_mic_ratio = compute_speaker_channel_energy(
+        stereo.mic, stereo.system, segments, stereo.sample_rate
+    )
+
+    if not speaker_mic_ratio:
         return segments, speakers
-
-    samples = np.frombuffer(raw, dtype=dtype)
-    # Ensure even number of samples for stereo reshape
-    if len(samples) % 2 != 0:
-        samples = samples[:-1]
-    samples = samples.reshape(-1, 2).astype(np.float32)
-    mic_ch = samples[:, 0]    # Left = mic = YOU
-    sys_ch = samples[:, 1]    # Right = system = REMOTE
-
-    # Compute per-speaker energy on each channel
-    speaker_mic_energy: dict[str, float] = {}
-    speaker_sys_energy: dict[str, float] = {}
-    speaker_total_frames: dict[str, int] = {}
-
-    for seg in segments:
-        if not seg.speaker:
-            continue
-
-        start_frame = int(seg.start * file_sr)
-        end_frame = int(seg.end * file_sr)
-        start_frame = max(0, min(start_frame, len(mic_ch)))
-        end_frame = max(0, min(end_frame, len(mic_ch)))
-
-        if end_frame <= start_frame:
-            continue
-
-        mic_slice = mic_ch[start_frame:end_frame]
-        sys_slice = sys_ch[start_frame:end_frame]
-
-        # RMS energy
-        mic_rms = float(np.sqrt(np.mean(mic_slice ** 2)))
-        sys_rms = float(np.sqrt(np.mean(sys_slice ** 2)))
-
-        speaker_mic_energy[seg.speaker] = speaker_mic_energy.get(seg.speaker, 0.0) + mic_rms * (end_frame - start_frame)
-        speaker_sys_energy[seg.speaker] = speaker_sys_energy.get(seg.speaker, 0.0) + sys_rms * (end_frame - start_frame)
-        speaker_total_frames[seg.speaker] = speaker_total_frames.get(seg.speaker, 0) + (end_frame - start_frame)
-
-    if not speaker_total_frames:
-        return segments, speakers
-
-    # Compute weighted average mic ratio for each speaker
-    # mic_ratio = avg_mic_energy / (avg_mic_energy + avg_sys_energy)
-    # Higher ratio = more likely to be YOU (mic channel)
-    speaker_mic_ratio: dict[str, float] = {}
-    for spk in speaker_total_frames:
-        total = speaker_total_frames[spk]
-        if total == 0:
-            continue
-        avg_mic = speaker_mic_energy.get(spk, 0.0) / total
-        avg_sys = speaker_sys_energy.get(spk, 0.0) / total
-        denom = avg_mic + avg_sys
-        if denom > 0:
-            speaker_mic_ratio[spk] = avg_mic / denom
-        else:
-            speaker_mic_ratio[spk] = 0.5  # No energy — unknown
 
     # Log the ratios for debugging
     print(f"  Channel analysis:")
@@ -649,3 +888,73 @@ def _is_stereo(audio_file: Path) -> bool:
         return int(result.stdout.strip()) == 2
     except ValueError:
         return False
+
+
+def post_process(
+    transcript: "Transcript",
+    output_dir: Path,
+    basename: str,
+    *,
+    summarize: bool = True,
+    summary_model: str | None = None,
+    progress_callback=None,
+) -> dict:
+    """Run summarization and PDF generation after transcription.
+
+    This is the shared post-processing step used by both CLI and GUI.
+    Summary generation is best-effort — failures are caught and logged via
+    ``progress_callback`` but do not abort PDF generation.
+
+    Args:
+        transcript:       The completed Transcript object.
+        output_dir:       Directory to write output files into.
+        basename:         Stem for output filenames (e.g. "meeting-20260313-231509").
+        summarize:        Whether to attempt AI summarization via Ollama.
+        summary_model:    Ollama model name override; None uses the default.
+        progress_callback: Optional callable(str) for status/error messages.
+
+    Returns:
+        Dict with keys "summary" (Path or None) and "pdf" (Path or None).
+    """
+    def _log(msg: str) -> None:
+        if progress_callback:
+            progress_callback(msg)
+
+    result: dict = {"summary": None, "pdf": None}
+    summary_result = None
+
+    if summarize:
+        try:
+            from meet.summarize import (
+                summarize as do_summarize, SummaryConfig, is_ollama_available,
+            )
+            if is_ollama_available():
+                cfg_kwargs: dict = {}
+                if summary_model:
+                    cfg_kwargs["model"] = summary_model
+                summary_config = SummaryConfig(**cfg_kwargs)
+                summary_result = do_summarize(
+                    transcript.to_text(), summary_config,
+                    language=transcript.language,
+                )
+                path = summary_result.save(output_dir, basename)
+                result["summary"] = path
+                _log(f"Summary generated in {summary_result.elapsed_seconds:.1f}s")
+            else:
+                _log("Ollama not running — skipping summary")
+        except Exception as exc:
+            _log(f"Summary failed: {exc}")
+
+    try:
+        from meet.pdf import generate_pdf
+        pdf_path = output_dir / f"{basename}.pdf"
+        generate_pdf(
+            transcript, pdf_path,
+            summary=summary_result,
+            language=getattr(transcript, "language", "en"),
+        )
+        result["pdf"] = pdf_path
+    except Exception as exc:
+        _log(f"PDF generation failed: {exc}")
+
+    return result

@@ -20,11 +20,13 @@ from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY
+from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_JUSTIFY, TA_RIGHT
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.lib.colors import HexColor
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     BaseDocTemplate,
     Frame,
@@ -39,6 +41,73 @@ from reportlab.platypus import (
 if TYPE_CHECKING:
     from meet.transcribe import Transcript
     from meet.summarize import MeetingSummary
+
+
+# ─── Font registration ──────────────────────────────────────────────────────
+
+# DejaVu Sans covers Latin, Cyrillic, Greek, Turkish, and most European scripts.
+_DEJAVU_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+_DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+# Noto Naskh Arabic for Farsi/Persian RTL text.
+_NOTO_ARABIC_REGULAR = "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf"
+_NOTO_ARABIC_BOLD = "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf"
+
+_fonts_registered = False
+
+from meet.languages import RTL_LANGUAGES as _RTL_LANGUAGES, PDF_SECTIONS as _PDF_SECTIONS  # noqa: E402
+
+
+def _register_fonts():
+    """Register Unicode TrueType fonts (called once)."""
+    global _fonts_registered
+    if _fonts_registered:
+        return
+    if Path(_DEJAVU_REGULAR).exists():
+        pdfmetrics.registerFont(TTFont("DejaVuSans", _DEJAVU_REGULAR))
+        pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", _DEJAVU_BOLD))
+        pdfmetrics.registerFontFamily(
+            "DejaVuSans", normal="DejaVuSans", bold="DejaVuSans-Bold",
+        )
+    if Path(_NOTO_ARABIC_REGULAR).exists():
+        pdfmetrics.registerFont(TTFont("NotoNaskhArabic", _NOTO_ARABIC_REGULAR))
+        pdfmetrics.registerFont(TTFont("NotoNaskhArabic-Bold", _NOTO_ARABIC_BOLD))
+        pdfmetrics.registerFontFamily(
+            "NotoNaskhArabic", normal="NotoNaskhArabic", bold="NotoNaskhArabic-Bold",
+        )
+    _fonts_registered = True
+
+
+def _get_font_names(language: str) -> tuple[str, str]:
+    """Return (regular, bold) font names appropriate for the language.
+
+    DejaVu Sans is used for ALL languages (including RTL) as it has full
+    Arabic/Persian glyph coverage and consistent rendering.
+    """
+    if Path(_DEJAVU_REGULAR).exists():
+        return ("DejaVuSans", "DejaVuSans-Bold")
+    # Fallback to built-in Helvetica (Latin-1 only).
+    return ("Helvetica", "Helvetica-Bold")
+
+
+def _is_rtl(language: str) -> bool:
+    """Check if a language uses right-to-left script."""
+    return language in _RTL_LANGUAGES
+
+
+def _reshape_rtl(text: str) -> str:
+    """Reshape and reorder RTL text for PDF rendering.
+
+    ReportLab does not handle RTL natively, so we use arabic-reshaper
+    to join glyphs and python-bidi to reorder for visual display.
+    Returns the original text unchanged if the libraries are not installed.
+    """
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+        reshaped = arabic_reshaper.reshape(text)
+        return get_display(reshaped)
+    except ImportError:
+        return text
 
 
 # ─── Constants ──────────────────────────────────────────────────────────────
@@ -60,8 +129,13 @@ _COLOR_LIGHT_BG = HexColor("#f5f5f5")   # Light background for summary box
 
 # ─── Styles ─────────────────────────────────────────────────────────────────
 
-def _build_styles():
+def _build_styles(language: str = "en"):
     """Build the paragraph styles used in the PDF."""
+    _register_fonts()
+    font_regular, font_bold = _get_font_names(language)
+    rtl = _is_rtl(language)
+    text_align = TA_RIGHT if rtl else TA_JUSTIFY
+
     styles = getSampleStyleSheet()
 
     s = {}
@@ -69,26 +143,29 @@ def _build_styles():
     s["title"] = ParagraphStyle(
         "PDFTitle",
         parent=styles["Title"],
+        fontName=font_bold,
         fontSize=20,
         leading=26,
         textColor=_COLOR_PRIMARY,
-        alignment=TA_LEFT,
+        alignment=TA_RIGHT if rtl else TA_LEFT,
         spaceAfter=4,
     )
 
     s["subtitle"] = ParagraphStyle(
         "PDFSubtitle",
         parent=styles["Normal"],
+        fontName=font_regular,
         fontSize=10,
         leading=14,
         textColor=_COLOR_TIMESTAMP,
-        alignment=TA_LEFT,
+        alignment=TA_RIGHT if rtl else TA_LEFT,
         spaceAfter=2,
     )
 
     s["section_heading"] = ParagraphStyle(
         "SectionHeading",
         parent=styles["Heading2"],
+        fontName=font_bold,
         fontSize=14,
         leading=18,
         textColor=_COLOR_PRIMARY,
@@ -96,38 +173,56 @@ def _build_styles():
         spaceAfter=8,
         borderWidth=0,
         borderPadding=0,
+        alignment=TA_RIGHT if rtl else TA_LEFT,
     )
 
     s["summary_heading"] = ParagraphStyle(
         "SummaryHeading",
         parent=styles["Heading3"],
+        fontName=font_bold,
         fontSize=12,
         leading=16,
         textColor=_COLOR_SECONDARY,
         spaceBefore=10,
         spaceAfter=4,
+        alignment=TA_RIGHT if rtl else TA_LEFT,
     )
 
     s["summary_body"] = ParagraphStyle(
         "SummaryBody",
         parent=styles["Normal"],
+        fontName=font_regular,
         fontSize=10,
         leading=14,
         textColor=_COLOR_TEXT,
-        alignment=TA_JUSTIFY,
+        alignment=text_align,
         spaceAfter=4,
     )
 
-    s["summary_bullet"] = ParagraphStyle(
-        "SummaryBullet",
-        parent=styles["Normal"],
-        fontSize=10,
-        leading=14,
-        textColor=_COLOR_TEXT,
-        leftIndent=18,
-        firstLineIndent=-12,
-        spaceAfter=3,
-    )
+    if rtl:
+        s["summary_bullet"] = ParagraphStyle(
+            "SummaryBullet",
+            parent=styles["Normal"],
+            fontName=font_regular,
+            fontSize=10,
+            leading=14,
+            textColor=_COLOR_TEXT,
+            rightIndent=18,
+            alignment=TA_RIGHT,
+            spaceAfter=3,
+        )
+    else:
+        s["summary_bullet"] = ParagraphStyle(
+            "SummaryBullet",
+            parent=styles["Normal"],
+            fontName=font_regular,
+            fontSize=10,
+            leading=14,
+            textColor=_COLOR_TEXT,
+            leftIndent=18,
+            firstLineIndent=-12,
+            spaceAfter=3,
+        )
 
     s["speaker"] = ParagraphStyle(
         "Speaker",
@@ -135,33 +230,38 @@ def _build_styles():
         fontSize=10,
         leading=14,
         textColor=_COLOR_SPEAKER,
-        fontName="Helvetica-Bold",
+        fontName=font_bold,
         spaceBefore=10,
         spaceAfter=2,
+        alignment=TA_RIGHT if rtl else TA_LEFT,
     )
 
     s["timestamp"] = ParagraphStyle(
         "Timestamp",
         parent=styles["Normal"],
+        fontName=font_regular,
         fontSize=8,
         leading=10,
         textColor=_COLOR_TIMESTAMP,
         spaceAfter=1,
+        alignment=TA_RIGHT if rtl else TA_LEFT,
     )
 
     s["transcript_text"] = ParagraphStyle(
         "TranscriptText",
         parent=styles["Normal"],
+        fontName=font_regular,
         fontSize=10,
         leading=14,
         textColor=_COLOR_TEXT,
-        alignment=TA_JUSTIFY,
+        alignment=text_align,
         spaceAfter=2,
     )
 
     s["footer"] = ParagraphStyle(
         "Footer",
         parent=styles["Normal"],
+        fontName=font_regular,
         fontSize=8,
         leading=10,
         textColor=_COLOR_TIMESTAMP,
@@ -173,14 +273,7 @@ def _build_styles():
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 
-def _fmt_time(seconds: float) -> str:
-    """Format seconds as MM:SS or HH:MM:SS."""
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+from meet.utils import fmt_time_short as _fmt_time  # noqa: E402
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -249,64 +342,109 @@ def _group_speaker_turns(transcript: "Transcript") -> list[dict]:
 
 # ─── Summary Markdown → Flowables ──────────────────────────────────────────
 
-def _summary_to_flowables(summary_md: str, styles: dict) -> list:
+def _md_to_markup(text: str, rtl_wrap=None) -> str:
+    """Convert inline Markdown (bold, italic) to ReportLab XML markup.
+
+    Handles **bold**, *italic*, and mixed patterns.  XML-escapes all
+    plain-text segments so the result is safe for Paragraph().
+    """
+    if rtl_wrap is None:
+        rtl_wrap = lambda t: t  # noqa: E731
+
+    # Split on bold markers first (**...**), then italic (*...*)
+    parts = re.split(r"(\*\*.*?\*\*)", text)
+    built = ""
+    for part in parts:
+        if part.startswith("**") and part.endswith("**"):
+            inner = part[2:-2]
+            built += f"<b>{rtl_wrap(_escape_xml(inner))}</b>"
+        else:
+            # Handle italic (*...*) within non-bold segments
+            sub_parts = re.split(r"(\*[^*]+?\*)", part)
+            for sp in sub_parts:
+                if sp.startswith("*") and sp.endswith("*") and len(sp) > 2:
+                    inner = sp[1:-1]
+                    built += f"<i>{rtl_wrap(_escape_xml(inner))}</i>"
+                else:
+                    built += rtl_wrap(_escape_xml(sp))
+    return built
+
+
+def _summary_to_flowables(
+    summary_md: str, styles: dict, *, language: str = "en",
+) -> list:
     """Convert the Markdown summary into ReportLab flowables."""
     flowables: list = []
     lines = summary_md.split("\n")
+    rtl = _is_rtl(language)
+
+    def _rtl_wrap(text: str) -> str:
+        """Apply RTL reshaping if needed (after XML-escaping)."""
+        return _reshape_rtl(text) if rtl else text
 
     for line in lines:
         stripped = line.strip()
         if not stripped:
             continue
 
-        # ## Heading
-        if stripped.startswith("## "):
-            heading_text = _escape_xml(stripped[3:].strip())
-            flowables.append(
-                Paragraph(heading_text, styles["summary_heading"])
-            )
-
-        # - [ ] Checkbox item or - bullet
-        elif stripped.startswith("- [ ] ") or stripped.startswith("- [x] "):
-            bullet_text = stripped[6:].strip()
+        # ### Heading or ## Heading (strip leading #s)
+        heading_match = re.match(r"^(#{2,4})\s+(.+)$", stripped)
+        if heading_match:
+            heading_text = heading_match.group(2).strip()
+            # Remove wrapping bold from headings like ### **Title**
+            if heading_text.startswith("**") and heading_text.endswith("**"):
+                heading_text = heading_text[2:-2]
             flowables.append(
                 Paragraph(
-                    f"\u2610 {_escape_xml(bullet_text)}",
-                    styles["summary_bullet"],
+                    _rtl_wrap(_escape_xml(heading_text)),
+                    styles["summary_heading"],
                 )
             )
+            continue
 
-        elif stripped.startswith("- **") or stripped.startswith("- "):
-            bullet_text = stripped[2:].strip()
-            # Convert **bold** to <b>bold</b>
-            bullet_text = re.sub(
-                r"\*\*(.+?)\*\*",
-                r"<b>\1</b>",
-                _escape_xml(bullet_text),
-            )
-            # Re-escape after bold conversion — but bold tags should not be escaped
-            # Actually we need to escape first, then apply bold conversion
-            # Let's redo: escape the raw text, then convert bold markers
-            raw = stripped[2:].strip()
-            # Split on bold markers and rebuild
-            parts = re.split(r"(\*\*.+?\*\*)", raw)
-            built = ""
-            for part in parts:
-                if part.startswith("**") and part.endswith("**"):
-                    inner = part[2:-2]
-                    built += f"<b>{_escape_xml(inner)}</b>"
-                else:
-                    built += _escape_xml(part)
-
+        # Checkbox items: - [ ] or - [x]
+        if stripped.startswith("- [ ] ") or stripped.startswith("- [x] "):
+            bullet_text = _md_to_markup(stripped[6:].strip(), _rtl_wrap)
             flowables.append(
-                Paragraph(f"\u2022 {built}", styles["summary_bullet"])
+                Paragraph(
+                    f"\u2610 {bullet_text}", styles["summary_bullet"],
+                )
             )
+            continue
 
-        else:
-            # Regular paragraph text
+        # Bullet: - text, * text (with optional leading whitespace for sub-bullets)
+        bullet_match = re.match(r"^[-*]\s+(.+)$", stripped)
+        if bullet_match:
+            raw = bullet_match.group(1).strip()
+            built = _md_to_markup(raw, _rtl_wrap)
+            # Indent sub-bullets (original line had leading whitespace)
+            if line.startswith("    ") or line.startswith("\t"):
+                flowables.append(
+                    Paragraph(f"\u2013 {built}", styles["summary_bullet"])
+                )
+            else:
+                flowables.append(
+                    Paragraph(f"\u2022 {built}", styles["summary_bullet"])
+                )
+            continue
+
+        # Numbered list: 1. text, 2. text, etc.
+        numbered_match = re.match(r"^(\d+)[.)]\s+(.+)$", stripped)
+        if numbered_match:
+            num = numbered_match.group(1)
+            raw = numbered_match.group(2).strip()
+            built = _md_to_markup(raw, _rtl_wrap)
             flowables.append(
-                Paragraph(_escape_xml(stripped), styles["summary_body"])
+                Paragraph(f"{num}. {built}", styles["summary_bullet"])
             )
+            continue
+
+        # Regular paragraph text — still convert inline bold/italic
+        flowables.append(
+            Paragraph(
+                _md_to_markup(stripped, _rtl_wrap), styles["summary_body"],
+            )
+        )
 
     return flowables
 
@@ -357,6 +495,7 @@ def generate_pdf(
     output_path: str | Path,
     summary: "MeetingSummary | None" = None,
     title: str = "Meeting Transcript",
+    language: str = "en",
 ) -> Path:
     """Generate a PDF transcript document.
 
@@ -366,6 +505,8 @@ def generate_pdf(
         summary: Optional AI-generated meeting summary to include as
             the first section.
         title: Document title shown on the first page.
+        language: Language code (e.g. "en", "de", "fa") for font and
+            RTL selection.
 
     Returns:
         Path to the generated PDF file.
@@ -373,7 +514,9 @@ def generate_pdf(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    styles = _build_styles()
+    rtl = _is_rtl(language)
+    styles = _build_styles(language)
+    sections = _PDF_SECTIONS.get(language, _PDF_SECTIONS["en"])
     story: list = []
 
     # ── Title block ──
@@ -402,7 +545,12 @@ def generate_pdf(
 
     # ── Summary section (if provided) ──
     if summary:
-        story.append(Paragraph("AI Meeting Summary", styles["section_heading"]))
+        summary_title = sections["summary"]
+        if rtl:
+            summary_title = _reshape_rtl(summary_title)
+        story.append(Paragraph(
+            _escape_xml(summary_title), styles["section_heading"],
+        ))
         story.append(
             Paragraph(
                 f"<i>Generated by {_escape_xml(summary.model)} "
@@ -412,13 +560,20 @@ def generate_pdf(
         )
         story.append(Spacer(1, 4))
 
-        summary_flowables = _summary_to_flowables(summary.markdown, styles)
+        summary_flowables = _summary_to_flowables(
+            summary.markdown, styles, language=language,
+        )
         story.extend(summary_flowables)
 
         story.append(Spacer(1, 16))
 
     # ── Transcript section ──
-    story.append(Paragraph("Full Transcript", styles["section_heading"]))
+    transcript_title = sections["transcript"]
+    if rtl:
+        transcript_title = _reshape_rtl(transcript_title)
+    story.append(Paragraph(
+        _escape_xml(transcript_title), styles["section_heading"],
+    ))
     story.append(Spacer(1, 4))
 
     turns = _group_speaker_turns(transcript)
@@ -437,6 +592,8 @@ def generate_pdf(
 
         # Transcript text
         text = _escape_xml(turn["text"])
+        if rtl:
+            text = _reshape_rtl(text)
         story.append(Paragraph(text, styles["transcript_text"]))
 
     # ── Build PDF ──

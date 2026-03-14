@@ -22,42 +22,66 @@ DEFAULT_MODEL = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_TIMEOUT = 600  # 10 minutes max
 
-SYSTEM_PROMPT = """\
+from meet.languages import SECTION_HEADERS as _SECTION_HEADERS, LANG_NAMES as _LANGUAGE_NAMES  # noqa: E402
+
+
+def _build_system_prompt(language: str | None = None) -> str:
+    """Build the system prompt with section headers in the target language."""
+    lang = language or "en"
+    h = _SECTION_HEADERS.get(lang, _SECTION_HEADERS["en"])
+
+    lang_instruction = ""
+    if lang != "en":
+        lang_name = _LANGUAGE_NAMES.get(lang, lang)
+        lang_instruction = (
+            f"\n- CRITICAL: Write the ENTIRE summary in {lang_name}, "
+            f"including ALL section headers. Do NOT use any English text."
+        )
+
+    return f"""\
 You are a professional meeting assistant. Your task is to analyze a meeting \
 transcript and produce a structured summary.
 
 Output the summary in the following Markdown format exactly:
 
-## Meeting Overview
+## {h['overview']}
 A concise 2-3 sentence summary of what the meeting was about.
 
-## Key Topics Discussed
+## {h['topics']}
 - Topic 1: Brief description
 - Topic 2: Brief description
 (list all major topics)
 
-## Action Items
+## {h['actions']}
 - [ ] Action item description — Owner (if identifiable)
 (list all action items mentioned or implied)
 
-## Decisions Made
+## {h['decisions']}
 - Decision 1
 - Decision 2
 (list concrete decisions reached during the meeting)
 
-## Open Questions / Follow-ups
+## {h['questions']}
 - Question or follow-up item
 (list unresolved items that need future attention)
 
 Rules:
 - Be concise but comprehensive
-- Use the speaker labels (YOU, REMOTE, etc.) as-is — do not invent names
-- If no action items or decisions were explicitly stated, note "None explicitly stated"
+- Use the speaker labels exactly as they appear in the transcript — do not change or invent names
+- If no action items or decisions were explicitly stated, note "{h['none_stated']}"
 - Do not hallucinate or add information not present in the transcript
-- Keep the summary professional and objective"""
+- Keep the summary professional and objective{lang_instruction}"""
 
 USER_PROMPT_TEMPLATE = """\
 Please summarize the following meeting transcript:
+
+---
+{transcript}
+---"""
+
+USER_PROMPT_TEMPLATE_LANG = """\
+The following meeting transcript is in {language}. \
+Please summarize it in {language}.
 
 ---
 {transcript}
@@ -124,6 +148,7 @@ def list_models(url: str = OLLAMA_BASE_URL) -> list[str]:
 def summarize(
     transcript_text: str,
     config: SummaryConfig | None = None,
+    language: str | None = None,
 ) -> MeetingSummary:
     """Generate a structured meeting summary from transcript text.
 
@@ -131,6 +156,9 @@ def summarize(
         transcript_text: The plain-text transcript (as produced by
             Transcript.to_text()).
         config: Summary configuration. Uses defaults if not provided.
+        language: Language code of the transcript (e.g. "de", "fa").
+            When provided (and not "en"), the LLM is instructed to
+            write the summary in that language.
 
     Returns:
         MeetingSummary with the Markdown summary, model used, and timing.
@@ -150,12 +178,21 @@ def summarize(
             "Start it with: ollama serve"
         )
 
-    user_prompt = USER_PROMPT_TEMPLATE.format(transcript=transcript_text)
+    # Build prompts with language-aware section headers.
+    system_prompt = _build_system_prompt(language)
+
+    if language and language != "en":
+        lang_name = _LANGUAGE_NAMES.get(language, language)
+        user_prompt = USER_PROMPT_TEMPLATE_LANG.format(
+            language=lang_name, transcript=transcript_text,
+        )
+    else:
+        user_prompt = USER_PROMPT_TEMPLATE.format(transcript=transcript_text)
 
     payload: dict[str, Any] = {
         "model": config.model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "stream": False,
