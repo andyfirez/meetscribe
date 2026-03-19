@@ -8,12 +8,14 @@ Commands:
     meet devices         - List available audio devices
     meet check           - Check system prerequisites
     meet download        - Download alignment models
+    meet summarize FILE  - AI summary from a plain-text transcript file
     meet translate       - Translate a session's transcript
     meet label           - Assign real names to speakers in a session
 """
 
 from __future__ import annotations
 
+import json
 import signal
 import sys
 import time
@@ -23,6 +25,25 @@ import click
 
 from meet.capture import DRAIN_SECONDS
 from meet.utils import fmt_elapsed, fmt_size
+
+
+def _resolve_summary_language(text_path: Path, language: str) -> str | None:
+    """Language code for Ollama prompts, or None for English-default prompts."""
+    if language != "auto":
+        return language if language.strip() else None
+    json_path = text_path.with_suffix(".json")
+    try:
+        raw = json_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    lang = data.get("language")
+    if not isinstance(lang, str) or not lang.strip() or lang.strip() == "auto":
+        return None
+    return lang.strip()
 
 
 def _drain_countdown(session, seconds: int = DRAIN_SECONDS) -> None:
@@ -605,6 +626,74 @@ def download(languages, download_all):
             download_alignment_model(lang, progress_callback=lambda msg: click.echo(f"  {msg}"))
         except Exception as exc:
             click.echo(f"  Error downloading {details['name']} ({lang}): {exc}", err=True)
+
+
+@main.command("summarize")
+@click.argument("transcript_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--output-dir", "-o", type=click.Path(), default=None,
+              help="Directory for <basename>.summary.md (default: same as transcript)")
+@click.option("--language", "-l", type=str, default="auto",
+              help="Language code for prompts, or 'auto' (read from sidecar .json if present)")
+@click.option("--summary-model", type=str, default=None,
+              help="Ollama model for summary (default: qwen3.5:9b)")
+def summarize_text(transcript_file, output_dir, language, summary_model):
+    """Generate an AI meeting summary from a plain-text transcript (UTF-8).
+
+    \b
+    The file should be meeting text in the same style as meetscribe .txt output.
+    Writes <basename>.summary.md next to the file (or under --output-dir).
+
+    \b
+    With --language auto, if <basename>.json exists (e.g. from meet transcribe),
+    its \"language\" field is used for summary prompts.
+
+    \b
+    Examples:
+        meet summarize ~/meet-recordings/meeting-20260312/meeting-20260312.txt
+        meet summarize transcript.txt -l de --summary-model gemma3:12b
+    """
+    from meet.summarize import summarize as do_summarize, SummaryConfig, is_ollama_available
+
+    text_path = Path(transcript_file)
+    try:
+        transcript_body = text_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        click.echo(f"Error: cannot read {text_path}: {exc}", err=True)
+        raise SystemExit(1)
+
+    if not transcript_body:
+        click.echo(f"Error: transcript file is empty: {text_path}", err=True)
+        raise SystemExit(1)
+
+    if not is_ollama_available():
+        click.echo("Error: Ollama is not running. Start with: ollama serve", err=True)
+        raise SystemExit(1)
+
+    out_dir = Path(output_dir) if output_dir else text_path.parent
+    basename = text_path.stem
+    lang = _resolve_summary_language(text_path, language)
+
+    config_kwargs: dict[str, str] = {}
+    if summary_model:
+        config_kwargs["model"] = summary_model
+    summary_config = SummaryConfig(**config_kwargs)
+
+    click.echo(f"Summarizing: {text_path}")
+    click.echo(f"  Model: {summary_config.model}")
+    if lang:
+        click.echo(f"  Language: {lang}")
+    elif language == "auto":
+        click.echo("  Language: en (default; no sidecar .json language)")
+    click.echo()
+
+    try:
+        result = do_summarize(transcript_body, summary_config, language=lang)
+    except (ConnectionError, RuntimeError) as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise SystemExit(1)
+
+    path = result.save(out_dir, basename)
+    click.echo(f"Summary saved: {path} ({result.elapsed_seconds:.1f}s)")
 
 
 @main.command()

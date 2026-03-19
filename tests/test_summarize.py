@@ -2,41 +2,36 @@
 
 from __future__ import annotations
 
-import pytest
-
 from meet.summarize import _build_system_prompt
-from meet.languages import SECTION_HEADERS as _SECTION_HEADERS
+from meet.languages import LANG_NAMES as _LANG_NAMES
 
 
 class TestBuildSystemPrompt:
-    def test_english_default(self):
+    def test_english_default(self) -> None:
         prompt = _build_system_prompt("en")
-        assert "Meeting Overview" in prompt
-        assert "Key Topics Discussed" in prompt
-        assert "Action Items" in prompt
-        assert "Decisions Made" in prompt
-        assert "Open Questions" in prompt
+        assert "эксперт по оценке кандидатов" in prompt
+        assert "ОТВЕТСТВЕННОСТЬ" in prompt
+        assert "КТО ОЦЕНИВАЕТСЯ" in prompt
+        assert "СТРОГО ЗАПРЕЩЕНО" in prompt
+        assert "ЯЗЫК ОТВЕТА" not in prompt
 
-    def test_farsi_headers(self):
+    def test_farsi_output_instruction(self) -> None:
         prompt = _build_system_prompt("fa")
-        h = _SECTION_HEADERS["fa"]
-        assert h["overview"] in prompt  # "خلاصه جلسه"
-        assert h["topics"] in prompt
-        assert h["actions"] in prompt
-        # Should contain the "write ENTIRE summary in Persian" instruction
         assert "Persian" in prompt or "Farsi" in prompt
+        assert "ЯЗЫК ОТВЕТА" in prompt
 
-    def test_all_supported_languages(self):
-        """Every language in _SECTION_HEADERS should produce a valid prompt."""
-        for lang in _SECTION_HEADERS:
+    def test_all_supported_languages(self) -> None:
+        """Known LANG_NAMES (non-en) append an output-language block."""
+        for lang in _LANG_NAMES:
             prompt = _build_system_prompt(lang)
-            h = _SECTION_HEADERS[lang]
-            assert h["overview"] in prompt
-            assert h["topics"] in prompt
-            assert h["actions"] in prompt
-            assert h["decisions"] in prompt
-            assert h["questions"] in prompt
+            assert "КРИТЕРИИ ОЦЕНКИ" in prompt
+            if lang == "en":
+                assert "ЯЗЫК ОТВЕТА" not in prompt
+            else:
+                assert _LANG_NAMES[lang] in prompt
+                assert "ЯЗЫК ОТВЕТА" in prompt
 
-    def test_unknown_language_falls_back_to_english(self):
+    def test_unknown_language_no_extra_block(self) -> None:
         prompt = _build_system_prompt("xx")
-        assert "Meeting Overview" in prompt
+        assert "эксперт по оценке кандидатов" in prompt
+        assert "ЯЗЫК ОТВЕТА" not in prompt

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 LANG_NAMES: dict[str, str] = {
     "en": "English",
+    "ru": "Russian",
     "de": "German",
     "fr": "French",
     "es": "Spanish",

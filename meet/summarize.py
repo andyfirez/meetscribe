@@ -1,16 +1,16 @@
-"""Meeting summary generation using local LLMs via Ollama.
+"""Interview evaluation generation using local LLMs via Ollama.
 
-Sends the transcript text to a local Ollama model and returns a structured
-Markdown summary with: overview, key topics, action items, decisions, and
-open questions.
+Sends the call transcript to a local Ollama model and returns a structured
+Markdown rubric: five criteria (1–5), explanations, total score, and
+admission recommendation.
 
 Requires Ollama running locally (http://localhost:11434).
 """
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -22,95 +22,58 @@ DEFAULT_MODEL = "qwen3.5:9b"
 OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_TIMEOUT = 600  # 10 minutes max
 
-from meet.languages import SECTION_HEADERS as _SECTION_HEADERS, LANG_NAMES as _LANGUAGE_NAMES  # noqa: E402
+from meet.languages import LANG_NAMES as _LANGUAGE_NAMES  # noqa: E402
+
+_PROMPT_CACHE: dict[str, str] = {}
+
+
+def _load_prompt_file(name: str) -> str:
+    """Load a UTF-8 prompt template from meet/prompts (cached)."""
+    if name not in _PROMPT_CACHE:
+        _PROMPT_CACHE[name] = files("meet.prompts").joinpath(name).read_text(encoding="utf-8")
+    return _PROMPT_CACHE[name]
 
 
 def _build_system_prompt(language: str | None = None) -> str:
-    """Build the system prompt with section headers in the target language."""
+    """Build the system prompt; optional block forces output language."""
     lang = language or "en"
-    h = _SECTION_HEADERS.get(lang, _SECTION_HEADERS["en"])
 
     lang_instruction = ""
-    if lang != "en":
-        lang_name = _LANGUAGE_NAMES.get(lang, lang)
+    if lang != "en" and lang in _LANGUAGE_NAMES:
+        lang_name = _LANGUAGE_NAMES[lang]
         lang_instruction = (
-            f"\n- CRITICAL: Write the ENTIRE summary in {lang_name}, "
-            f"including ALL section headers. Do NOT use any English text."
+            f"\n\n### ЯЗЫК ОТВЕТА\n"
+            f"Оформи весь текст оценки (заголовки разделов, пояснения, "
+            f"таблица, рекомендация) на {lang_name}."
         )
 
-    return f"""\
-You are a professional meeting assistant. Your task is to analyze a meeting \
-transcript and produce a structured summary.
-
-Output the summary in the following Markdown format exactly:
-
-## {h['overview']}
-A concise 2-3 sentence summary of what the meeting was about.
-
-## {h['topics']}
-- Topic 1: Brief description
-- Topic 2: Brief description
-(list all major topics)
-
-## {h['actions']}
-- [ ] Action item description — Owner (if identifiable)
-(list all action items mentioned or implied)
-
-## {h['decisions']}
-- Decision 1
-- Decision 2
-(list concrete decisions reached during the meeting)
-
-## {h['questions']}
-- Question or follow-up item
-(list unresolved items that need future attention)
-
-Rules:
-- Be concise but comprehensive
-- Use the speaker labels exactly as they appear in the transcript — do not change or invent names
-- If no action items or decisions were explicitly stated, note "{h['none_stated']}"
-- Do not hallucinate or add information not present in the transcript
-- Keep the summary professional and objective{lang_instruction}"""
-
-USER_PROMPT_TEMPLATE = """\
-Please summarize the following meeting transcript:
-
----
-{transcript}
----"""
-
-USER_PROMPT_TEMPLATE_LANG = """\
-The following meeting transcript is in {language}. \
-Please summarize it in {language}.
-
----
-{transcript}
----"""
+    tpl = _load_prompt_file("summary_system.txt")
+    return tpl.format(lang_instruction=lang_instruction)
 
 
 # ─── Data classes ───────────────────────────────────────────────────────────
 
 @dataclass
 class SummaryConfig:
-    """Configuration for meeting summary generation."""
+    """Configuration for interview evaluation generation."""
 
     model: str = DEFAULT_MODEL
     ollama_url: str = OLLAMA_BASE_URL
     timeout: int = DEFAULT_TIMEOUT
-    temperature: float = 0.3
-    num_ctx: int = 8192
+    temperature: float = 0.2
+    num_ctx: int = 32768
 
 
 @dataclass
 class MeetingSummary:
-    """Result of a meeting summary generation."""
+    """Result of interview evaluation generation (saved as .summary.md)."""
 
     markdown: str
     model: str
     elapsed_seconds: float
 
     def save(self, output_dir: str | Path, basename: str) -> Path:
-        """Save the summary as a .summary.md file.
+        """Save the evaluation as a .summary.md file.
 
         Returns the path to the saved file.
         """
@@ -150,7 +113,7 @@ def summarize(
     config: SummaryConfig | None = None,
     language: str | None = None,
 ) -> MeetingSummary:
-    """Generate a structured meeting summary from transcript text.
+    """Generate a structured interview evaluation from transcript text.
 
     Args:
         transcript_text: The plain-text transcript (as produced by
@@ -158,10 +121,10 @@ def summarize(
         config: Summary configuration. Uses defaults if not provided.
         language: Language code of the transcript (e.g. "de", "fa").
             When provided (and not "en"), the LLM is instructed to
-            write the summary in that language.
+            write the evaluation in that language.
 
     Returns:
-        MeetingSummary with the Markdown summary, model used, and timing.
+        MeetingSummary with the Markdown evaluation, model used, and timing.
 
     Raises:
         ConnectionError: If Ollama is not reachable.
@@ -178,16 +141,15 @@ def summarize(
             "Start it with: ollama serve"
         )
 
-    # Build prompts with language-aware section headers.
     system_prompt = _build_system_prompt(language)
 
     if language and language != "en":
         lang_name = _LANGUAGE_NAMES.get(language, language)
-        user_prompt = USER_PROMPT_TEMPLATE_LANG.format(
-            language=lang_name, transcript=transcript_text,
-        )
+        user_tpl = _load_prompt_file("summary_user_lang.txt")
+        user_prompt = user_tpl.format(language=lang_name, transcript=transcript_text)
     else:
-        user_prompt = USER_PROMPT_TEMPLATE.format(transcript=transcript_text)
+        user_tpl = _load_prompt_file("summary_user.txt")
+        user_prompt = user_tpl.format(transcript=transcript_text)
 
     payload: dict[str, Any] = {
         "model": config.model,
@@ -200,6 +162,8 @@ def summarize(
         "options": {
             "temperature": config.temperature,
             "num_ctx": config.num_ctx,
+            # Снижает уход модели в «чужой» жанр (диплом, статья) вместо рубрики
+            "repeat_penalty": 1.12,
         },
     }
 
