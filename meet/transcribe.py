@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import gc
 import json
+
+from huggingface_hub.errors import GatedRepoError
 import os
 import subprocess
 import tempfile
@@ -350,6 +352,20 @@ class TranscriptionConfig:
         # Resolve model aliases (e.g. "large-v3-turbo" -> local CTranslate2 path)
         self.model = resolve_model(self.model)
 
+        # Fall back to CPU when CUDA is not available (e.g. PyTorch CPU-only build)
+        if self.device == "cuda":
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    self.device = "cpu"
+                    # float16 is not supported on CPU; use int8 for speed
+                    if self.compute_type == "float16":
+                        self.compute_type = "int8"
+            except ImportError:
+                self.device = "cpu"
+                if self.compute_type == "float16":
+                    self.compute_type = "int8"
+
         if self.hf_token is None:
             self.hf_token = os.environ.get("HF_TOKEN")
         if self.hf_token is None:
@@ -518,13 +534,31 @@ def _mixdown_to_mono(audio_file: Path) -> Path:
             raise RuntimeError(f"Mono mixdown failed: {result.stderr}")
         return Path(tmp.name)
 
-    # ── Read stereo WAV ──
-    with wave.open(str(audio_file), "r") as wf:
-        n_channels = wf.getnchannels()
-        sampwidth = wf.getsampwidth()
-        framerate = wf.getframerate()
-        n_frames = wf.getnframes()
-        raw = wf.readframes(n_frames)
+    # ── Read stereo WAV (or fall back to ffmpeg for MP4/MKV/etc) ──
+    try:
+        with wave.open(str(audio_file), "r") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw = wf.readframes(n_frames)
+    except wave.Error:
+        # Non-WAV format (MP4, MKV, etc.) — use ffmpeg
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(audio_file),
+            "-filter_complex", "[0:a]pan=mono|c0=0.5*c0+0.5*c1[out]",
+            "-map", "[out]",
+            "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            tmp.name,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Mono mixdown failed: {result.stderr}")
+        return Path(tmp.name)
 
     if n_channels != 2 or sampwidth != 2:
         # Not the expected stereo 16-bit — fall through to ffmpeg.
@@ -723,23 +757,33 @@ def transcribe(audio_file: str | Path, config: TranscriptionConfig | None = None
         # ── Step 3: Speaker diarization ──
         if config.hf_token:
             print(f"  Running speaker diarization...")
-            diarize_model = DiarizationPipeline(
-                token=config.hf_token,
-                device=config.device,
-            )
+            try:
+                diarize_model = DiarizationPipeline(
+                    token=config.hf_token,
+                    device=config.device,
+                )
 
-            diarize_kwargs: dict[str, Any] = {}
-            if config.min_speakers is not None:
-                diarize_kwargs["min_speakers"] = config.min_speakers
-            if config.max_speakers is not None:
-                diarize_kwargs["max_speakers"] = config.max_speakers
+                diarize_kwargs: dict[str, Any] = {}
+                if config.min_speakers is not None:
+                    diarize_kwargs["min_speakers"] = config.min_speakers
+                if config.max_speakers is not None:
+                    diarize_kwargs["max_speakers"] = config.max_speakers
 
-            diarize_segments = diarize_model(audio, **diarize_kwargs)
-            result = whisperx.assign_word_speakers(diarize_segments, result)
+                diarize_segments = diarize_model(audio, **diarize_kwargs)
+                result = whisperx.assign_word_speakers(diarize_segments, result)
 
-            del diarize_model
-            gc.collect()
-            torch.cuda.empty_cache()
+                del diarize_model
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception as diarize_exc:
+                if isinstance(diarize_exc, GatedRepoError):
+                    print(
+                        "  Warning: Cannot access pyannote diarization model. "
+                        "Accept terms at https://huggingface.co/pyannote/speaker-diarization-community-1"
+                    )
+                    print("  Continuing without speaker diarization.")
+                else:
+                    raise
         else:
             print(f"  Skipping diarization (no HF_TOKEN provided)")
 
